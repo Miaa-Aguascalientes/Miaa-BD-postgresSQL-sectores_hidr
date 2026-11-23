@@ -81,41 +81,11 @@ CSV_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?form
 TARGET_SCHEMA = "Sectorizacion"
 TARGET_TABLE = "sectores_hidr"
 
-# Columnas esperadas (excluyendo geom para proteger la geometría espacial en PostGIS)
-COLUMNAS_ATRIBUTOS = [
-    "fid",
-    "sector",
-    "Pozos_Sector",
-    "Cantidad_Pozos",
-    "AREA",
-    "USUARIOS",
-    "USU_DOM",
-    "POB_2025",
-    "Q_PROD",
-    "VOL_PROD-MES",
-    "LONG_RED",
-    "CONS_PROM",
-    "VOL_FACT",
-    "DOM_A",
-    "DOM_B",
-    "DOM_C",
-    "COMERCIAL",
-    "FALTAS_AGUA",
-    "FUGAS",
-    "DOTACION",
-    "BAL_VOL",
-    "EF",
-    "ANF",
-    "IMP-FACT_US",
-    "PERD_US_MES",
-    "PERD_HAB_DIA",
-    "NIV_MOROSIDAD",
-    "FA_USUARIO",
-    "FUGAS_KM",
-]
-
 # Columnas de texto (el resto se limpian como numéricas si vienen formateadas en Sheets)
 COLUMNAS_TEXTO = {"sector", "Pozos_Sector"}
+
+# Columnas que nunca deben sobrescribirse para proteger PK y geometría
+COLUMNAS_PROTEGIDAS = {"geom", "fid"}
 
 
 # ==============================================================================
@@ -140,7 +110,6 @@ def cargar_datos_sheets(url: str) -> pd.DataFrame:
     response.raise_for_status()
     response.encoding = "utf-8"
     df = pd.read_csv(io.StringIO(response.text))
-    # Limpiar espacios accidentales en encabezados
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
@@ -151,15 +120,12 @@ def limpiar_valor_numerico(val):
     if isinstance(val, (int, float)):
         return float(val)
     s = str(val).strip()
-    if s in ("", "-", "N/A", "n/a", "#DIV/0!", "#VALUE!", "#N/A", "None", "nan"):
+    if s in ("", "-", "N/A", "n/a", "#DIV/0!", "#VALUE!", "#N/A", "None", "nan", "NaN"):
         return None
-    # Quitar símbolos de moneda, porcentaje, espacios y separadores de miles
     s_clean = re.sub(r"[$,%\s]", "", s)
-    # Si tiene comas como separador de miles (ej. 1,234.56)
     if "," in s_clean and "." in s_clean:
         s_clean = s_clean.replace(",", "")
     elif "," in s_clean and "." not in s_clean:
-        # Si solo hay una coma y tiene 3 dígitos después, es separador de miles
         parts = s_clean.split(",")
         if len(parts) == 2 and len(parts[1]) == 3:
             s_clean = s_clean.replace(",", "")
@@ -174,13 +140,13 @@ def limpiar_valor_numerico(val):
 def preparar_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     df = df_raw.copy()
 
-    # Ignorar geom si viene en la hoja para no tocar la geometría en PostgreSQL
     if "geom" in df.columns:
         df = df.drop(columns=["geom"])
 
-    # Filtrar filas completamente vacías en llaves principales
     if "fid" in df.columns and "sector" in df.columns:
         df = df.dropna(subset=["fid", "sector"], how="all")
+    elif "sector" in df.columns:
+        df = df.dropna(subset=["sector"])
     elif "fid" in df.columns:
         df = df.dropna(subset=["fid"])
 
@@ -217,36 +183,38 @@ def sincronizar_postgres(engine, df: pd.DataFrame, clave_cruce: str):
             f'No se encontró la tabla "{TARGET_SCHEMA}"."{TARGET_TABLE}" o no tiene columnas visibles.'
         )
 
-    # Mapeo insensible a mayúsculas/minúsculas para respetar nombres exactos en PostgreSQL
     mapa_pg_lower = {k.lower(): k for k in cols_pg.keys()}
 
-    columnas_validas = []
-    for col_sheet in df.columns:
-        if col_sheet.lower() == "geom":
-            continue
-        if col_sheet in cols_pg:
-            columnas_validas.append((col_sheet, col_sheet))
-        elif col_sheet.lower() in mapa_pg_lower:
-            columnas_validas.append((col_sheet, mapa_pg_lower[col_sheet.lower()]))
-
-    col_clave_pg = cols_pg.get(clave_cruce) and clave_cruce or mapa_pg_lower.get(clave_cruce.lower())
+    col_clave_pg = (
+        cols_pg[clave_cruce]
+        and clave_cruce
+        if clave_cruce in cols_pg
+        else mapa_pg_lower.get(clave_cruce.lower())
+    )
     if not col_clave_pg:
         raise ValueError(f"La llave de cruce '{clave_cruce}' no existe en la tabla de PostgreSQL.")
 
-    cols_update = [
-        (c_sheet, c_pg)
-        for c_sheet, c_pg in columnas_validas
-        if c_pg != col_clave_pg
-    ]
+    cols_update = []
+    for col_sheet in df.columns:
+        col_lower = col_sheet.lower()
+        if col_lower in COLUMNAS_PROTEGIDAS:
+            continue
+        if col_sheet in cols_pg:
+            c_pg = col_sheet
+        elif col_lower in mapa_pg_lower:
+            c_pg = mapa_pg_lower[col_lower]
+        else:
+            continue
+
+        if c_pg != col_clave_pg:
+            cols_update.append((col_sheet, c_pg))
 
     if not cols_update:
-        raise ValueError("No hay columnas coincidentes para actualizar entre Google Sheets y PostgreSQL.")
+        raise ValueError("No hay columnas actualizables coincidentes entre Google Sheets y PostgreSQL.")
 
-    # Construir sentencia SQL parametrizada con identificadores entrecomillados
     set_clauses = []
     for idx, (_, c_pg) in enumerate(cols_update):
         param_name = f"p_{idx}"
-        # Si en Postgres la columna es entera, redondear/castear limpiamente
         tipo_pg = cols_pg[c_pg].upper()
         if any(t in tipo_pg for t in ("INT", "BIGINT", "SMALLINT")):
             set_clauses.append(f'"{c_pg}" = CAST(:{param_name} AS BIGINT)')
@@ -312,18 +280,17 @@ with st.sidebar:
     st.header("⚙️ Configuración")
     clave_cruce = st.selectbox(
         "Llave primaria de cruce (WHERE)",
-        options=["fid", "sector"],
+        options=["sector", "fid"],
         index=0,
-        help="Columna usada para localizar cada registro en PostgreSQL sin alterar la geometría (geom).",
+        help="Columna usada para localizar cada registro en PostgreSQL sin alterar la geometría (geom) ni el fid.",
     )
     st.info(
-        "🛡️ **Protección Geoespacial Activa:** La columna `geom` se omite automáticamente durante la transferencia para preservar los polígonos en QGIS."
+        "🛡️ **Protección Activa:** Las columnas `geom` y `fid` se excluyen del `SET` para preservar polígonos y llaves primarias (`Sectores_hidr_pkey`)."
     )
     if st.button("🔄 Recargar Google Sheets", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-# Cargar datos de Google Sheets
 try:
     df_raw = cargar_datos_sheets(CSV_EXPORT_URL)
     df_clean = preparar_dataframe(df_raw)
@@ -331,7 +298,6 @@ except Exception as e:
     st.error(f"❌ Error al leer la hoja '{SHEET_NAME}' desde Google Sheets: {e}")
     st.stop()
 
-# Métricas superiores
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     st.markdown(
@@ -354,7 +320,6 @@ with col4:
         unsafe_allow_html=True,
     )
 
-# Diagnóstico de columnas y conexión
 tab_preview, tab_schema = st.tabs(["📋 Vista Previa de Datos (Sheets)", "🗄️ Auditoría de Esquema PostgreSQL"])
 
 with tab_preview:
@@ -364,14 +329,17 @@ with tab_schema:
     try:
         engine = get_pg_engine()
         cols_pg = obtener_columnas_tabla_pg(engine)
+        sheets_lower = {c.lower() for c in df_clean.columns}
         df_audit = pd.DataFrame(
             [
                 {
                     "Columna PostgreSQL": col,
                     "Tipo PostgreSQL": dtype,
-                    "Presente en Sheets": "✅ Sí"
-                    if col.lower() in {c.lower() for c in df_clean.columns}
-                    else ("🛡️ Protegida (geom)" if col.lower() == "geom" else "⚠️ No"),
+                    "Estado Sincronización": (
+                        "🛡️ Protegida (No se actualiza)"
+                        if col.lower() in COLUMNAS_PROTEGIDAS
+                        else ("🔑 Llave WHERE" if col.lower() == clave_cruce.lower() else ("✅ Mapeará desde Sheets" if col.lower() in sheets_lower else "⚠️ No encontrada en Sheets"))
+                    ),
                 }
                 for col, dtype in cols_pg.items()
             ]
@@ -382,8 +350,7 @@ with tab_schema:
 
 st.divider()
 
-# Acción principal de transferencia
-col_btn, col_info = st.columns([1, 2])
+col_btn, _ = st.columns([1, 2])
 with col_btn:
     ejecutar = st.button("🚀 Transferir Datos a PostgreSQL", use_container_width=True)
 
